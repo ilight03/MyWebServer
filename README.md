@@ -22,14 +22,9 @@ This project listens for client connections, reads HTTP requests, and sends back
 
 ## How to Run
 
-1. Clone the repository
-2. Open the project in VS Code
-3. Compile the Java file
-4. Run the server
-5. Open a browser and connect to the server using the correct localhost port
-
-Example:
+1. Clone this repository
+2. Open the project folder in VS Code
+3. Compile the server:
 
 ```bash
 javac MyWebServer.java
-java MyWebServer
