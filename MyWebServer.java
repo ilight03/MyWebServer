@@ -1,6 +1,7 @@
 import java.io.*;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.time.Instant;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter; //for date headers
 
@@ -14,7 +15,12 @@ public class MyWebServer {
             .format(DateTimeFormatter.RFC_1123_DATE_TIME);
    }
 
-    private static void sendHeaders(PrintWriter out, String status, long contentLength, String contentType) {
+    private static String formatHttpDate(long epochMillis) {
+    return ZonedDateTime.ofInstant(Instant.ofEpochMilli(epochMillis), java.time.ZoneId.of("GMT"))
+            .format(DateTimeFormatter.RFC_1123_DATE_TIME);
+   }
+
+    private static void sendHeaders(PrintWriter out, String status, long contentLength, String contentType, String lastModified, String connectionHeader) {
     System.out.println(status);
     out.println(status);
     //get the date and then print it so its the same
@@ -31,6 +37,16 @@ public class MyWebServer {
     if (contentType != null) {
         System.out.println("Content-Type: " + contentType);
         out.println("Content-Type: " + contentType);
+    }
+
+    if (lastModified != null) {
+        System.out.println("Last-Modified: " + lastModified);
+        out.println("Last-Modified: " + lastModified);
+    }
+
+    if (connectionHeader != null) {
+        System.out.println("Connection: " + connectionHeader);
+        out.println("Connection: " + connectionHeader);
     }
 
     System.out.println();
@@ -68,9 +84,10 @@ private static String getContentType(String path) {
     return "application/octet-stream"; // unknown type handler -> just send it as binary data
 }
 
-    private static void sendErrorResponse(PrintWriter out, String status, String method, String body) { //add method header parameter to make it more flexible for different error types
+    private static void sendErrorResponse(PrintWriter out, String status, String method, String body, String connectionHeader) { //add method header parameter to make it more flexible for different error types
     byte[] bodyBytes = body.getBytes(java.nio.charset.StandardCharsets.UTF_8);
-    sendHeaders(out, status, bodyBytes.length, "text/plain; charset=UTF-8");
+    long contentLength = method.equals("HEAD") ? 0 : bodyBytes.length;
+    sendHeaders(out, status, contentLength, "text/plain; charset=UTF-8", null, connectionHeader);
     if(!method.equals("HEAD")) { //only send body for get requests, not head
         out.print(body);
     }
@@ -102,63 +119,144 @@ private static String getContentType(String path) {
                 // ###### Fill in Start ######
                 BufferedReader socketInput = new BufferedReader(new InputStreamReader(clientSocket.getInputStream()));
                 PrintWriter socketOutput = new PrintWriter(clientSocket.getOutputStream(), true);
-                String requestLine = socketInput.readLine();
-                System.out.println(requestLine);
-                if (requestLine == null || requestLine.isBlank()) { //since i added method paramater, and 400's call error response before method is parsed, just gonna use UNKNOWN for now
-                    sendErrorResponse(socketOutput, "HTTP/1.1 400 Bad Request","UNKNOWN","Bad Request");
-                    return;
-                }
-                //parse it to separately get the header parts 
-                //i can do this bc i know what the header will look like.
-                String[] parts = requestLine.split(" ");
-                if (parts.length < 3) {
-                    sendErrorResponse(socketOutput, "HTTP/1.1 400 Bad Request","UNKNOWN","Bad Request");
-                    return;
-                }
-                String method = parts[0];
-                if (!method.equals("GET") && !method.equals("HEAD")) {
-                    sendErrorResponse(socketOutput, "HTTP/1.1 501 Not Implemented",method, "Not Implemented");
-                    return;
-                }
-
-                String path = parts[1];
-                if(path.equals("/")){//wrote a little hello html file for quick testing. 
-                   path = "/hello.html";
-                }
-                
-                String version = parts[2];
-                File file = new File("." + path);
-                if (!file.exists() || !file.isFile()) {
-                    sendErrorResponse(socketOutput, "HTTP/1.1 404 Not Found", method, "Not Found");
-                    System.out.println("Requested file not found: " + path);
-                    return;
-                }
-                
-                System.out.println("Method = " + method);
-                System.out.println("Path = " + path);
-                System.out.println("Version = " + version);
-
-                String line = null;
-                //gotta read the first couple headers separately first
-                //DO NOT SPLIT THE REST, THAT BROKE EVERYTHING
-                
-                while( (line=socketInput.readLine()) != null && !line.equals("")) {
-                    System.out.println(line);
-                }
-
-                System.out.println("\n");
                 OutputStream rawOut = clientSocket.getOutputStream();
-                sendHeaders(socketOutput, "HTTP/1.1 200 OK", file.length(), getContentType(path)); 
 
-                if (method.equals("GET")) { //file output is get only
-                    FileInputStream fileInput = new FileInputStream(file);
-                    int b;
-                    while((b=fileInput.read()) != -1){
-                        rawOut.write(b);
+                while (true) {
+                    String requestLine = socketInput.readLine();
+                    if (requestLine == null) {
+                        break;
                     }
-                    rawOut.flush();
-                    fileInput.close();
-                } //HEAD doesn't send body so we don't need to do anything else for it.
+                    if (requestLine.isBlank()) {
+                        continue;
+                    }
+
+                    System.out.println(requestLine);
+
+                    String[] parts = requestLine.split(" ");
+                    if (parts.length < 3) {
+                        sendErrorResponse(socketOutput, "HTTP/1.1 400 Bad Request", "UNKNOWN", "Bad Request", "close");
+                        break;
+                    }
+
+                    String method = parts[0];
+                    String path = parts[1];
+                    String version = parts[2];
+
+                    String line = null;
+                    String ifModifiedSinceValue = null;
+                    String connectionRequest = null;
+
+                    while ((line = socketInput.readLine()) != null && !line.equals("")) {
+                        System.out.println(line);
+                        if (line.regionMatches(true, 0, "If-Modified-Since:", 0, "If-Modified-Since:".length())) {
+                            ifModifiedSinceValue = line.substring("If-Modified-Since:".length()).trim();
+                            System.out.println("If-Modified-Since header value: " + ifModifiedSinceValue);
+                        }
+                        if (line.regionMatches(true, 0, "Connection:", 0, "Connection:".length())) {
+                            connectionRequest = line.substring("Connection:".length()).trim();
+                        }
+                    }
+
+                    if (line == null) {
+                        break;
+                    }
+
+                    boolean keepAlive = "HTTP/1.1".equalsIgnoreCase(version);
+                    if (connectionRequest != null) {
+                        if (connectionRequest.equalsIgnoreCase("close")) {
+                            keepAlive = false;
+                        } else if (connectionRequest.equalsIgnoreCase("keep-alive")) {
+                            keepAlive = true;
+                        }
+                    }
+                    String connectionResponse = keepAlive ? "keep-alive" : "close";
+
+                    if (!method.equals("GET") && !method.equals("HEAD")) {
+                        sendErrorResponse(socketOutput, "HTTP/1.1 501 Not Implemented", method, "Not Implemented", connectionResponse);
+                        if (!keepAlive) {
+                            break;
+                        }
+                        continue;
+                    }
+
+                    if (path.equals("/")) {
+                        path = "/hello.html";
+                    }
+                    if (path.contains("../") || path.contains("..\\")) {
+                        sendErrorResponse(socketOutput, "HTTP/1.1 403 Forbidden", method, "Forbidden", connectionResponse);
+                        if (!keepAlive) {
+                            break;
+                        }
+                        continue;
+                    }
+
+                    File root = new File(".").getCanonicalFile();
+                    File target = new File(root, path.startsWith("/") ? path.substring(1) : path).getCanonicalFile();
+                    if (!target.getPath().startsWith(root.getPath() + File.separator)) {
+                        sendErrorResponse(socketOutput, "HTTP/1.1 403 Forbidden", method, "Forbidden", connectionResponse);
+                        if (!keepAlive) {
+                            break;
+                        }
+                        continue;
+                    }
+
+                    File file = target;
+                    if (!file.exists() || !file.isFile()) {
+                        sendErrorResponse(socketOutput, "HTTP/1.1 404 Not Found", method, "Not Found", connectionResponse);
+                        System.out.println("Requested file not found: " + target.getPath());
+                        if (!keepAlive) {
+                            break;
+                        }
+                        continue;
+                    }
+
+                    System.out.println("Method = " + method);
+                    System.out.println("Path = " + path);
+                    System.out.println("Version = " + version);
+
+                    ZonedDateTime ifModifiedSince = null;
+                    if (ifModifiedSinceValue != null && !ifModifiedSinceValue.isEmpty()) {
+                        try {
+                            ifModifiedSince = ZonedDateTime.parse(ifModifiedSinceValue, DateTimeFormatter.RFC_1123_DATE_TIME);
+                        } catch (Exception e) {
+                            System.out.println("Invalid If-Modified-Since header: " + ifModifiedSinceValue);
+                        }
+                    }
+
+                    if (ifModifiedSince != null) {
+                        long fileMillis = file.lastModified();
+                        long headerMillis = ifModifiedSince.toInstant().toEpochMilli();
+                        System.out.println("If-Modified-Since parsed: " + ifModifiedSince);
+                        System.out.println("File lastModified millis: " + fileMillis);
+                        System.out.println("Header millis: " + headerMillis);
+
+                        if ((fileMillis / 1000) <= (headerMillis / 1000)) {
+                            sendHeaders(socketOutput, "HTTP/1.1 304 Not Modified", 0, null, null, connectionResponse);
+                            if (!keepAlive) {
+                                break;
+                            }
+                            continue;
+                        }
+                    }
+
+                    System.out.println("\n");
+                    String lastModified = formatHttpDate(file.lastModified());
+                    sendHeaders(socketOutput, "HTTP/1.1 200 OK", file.length(), getContentType(path), lastModified, connectionResponse);
+
+                    if (method.equals("GET")) {
+                        FileInputStream fileInput = new FileInputStream(file);
+                        int b;
+                        while ((b = fileInput.read()) != -1) {
+                            rawOut.write(b);
+                        }
+                        rawOut.flush();
+                        fileInput.close();
+                    }
+
+                    if (!keepAlive) {
+                        break;
+                    }
+                }
 
                 // ###### Fill in End ######
 
